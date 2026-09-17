@@ -5,15 +5,14 @@
 #
 # Restauration d'une sauvegarde chiffrée de /var/www/html
 #
-# Fonctionnement :
-# 1. Sélection de l'archive
-# 2. Recherche automatique de la clé correspondante
-# 3. Recherche automatique du SHA-256 correspondant
-# 4. Déchiffrement
-# 5. Vérification du SHA-256
-# 6. Restauration uniquement si le hash correspond
+# Vérifications :
 #
-# Les sauvegardes existantes ne sont pas supprimées.
+# 1. Hash SHA-256 de l'archive chiffrée
+# 2. Déchiffrement
+# 3. Hash SHA-256 de l'archive originale
+# 4. Vérification de l'archive TAR
+# 5. Restauration
+#
 # ============================================================
 
 set -euo pipefail
@@ -31,7 +30,7 @@ HASH_DIR="${BACKUP_ROOT}/hashes"
 RESTORE_DIR="/var/www"
 
 # ------------------------------------------------------------
-# Vérifications
+# Vérification root
 # ------------------------------------------------------------
 
 if [[ $EUID -ne 0 ]]; then
@@ -39,23 +38,33 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-if ! command -v openssl >/dev/null 2>&1; then
-    echo "[ERREUR] openssl n'est pas installé."
-    exit 1
-fi
+# ------------------------------------------------------------
+# Vérification des commandes
+# ------------------------------------------------------------
 
-if ! command -v tar >/dev/null 2>&1; then
-    echo "[ERREUR] tar n'est pas installé."
-    exit 1
-fi
+for COMMAND in openssl tar sha256sum; do
+    if ! command -v "$COMMAND" >/dev/null 2>&1; then
+        echo "[ERREUR] La commande '$COMMAND' n'est pas disponible."
+        exit 1
+    fi
+done
 
-if ! command -v sha256sum >/dev/null 2>&1; then
-    echo "[ERREUR] sha256sum n'est pas disponible."
-    exit 1
-fi
+# ------------------------------------------------------------
+# Vérification des dossiers
+# ------------------------------------------------------------
 
 if [[ ! -d "$ARCHIVE_DIR" ]]; then
     echo "[ERREUR] Le dossier $ARCHIVE_DIR n'existe pas."
+    exit 1
+fi
+
+if [[ ! -d "$KEY_DIR" ]]; then
+    echo "[ERREUR] Le dossier $KEY_DIR n'existe pas."
+    exit 1
+fi
+
+if [[ ! -d "$HASH_DIR" ]]; then
+    echo "[ERREUR] Le dossier $HASH_DIR n'existe pas."
     exit 1
 fi
 
@@ -131,7 +140,7 @@ echo "Archive sélectionnée :"
 echo "$ARCHIVE_ENC"
 
 # ------------------------------------------------------------
-# Recherche de la clé correspondante
+# Recherche de la clé
 # ------------------------------------------------------------
 
 KEY_FILE="${KEY_DIR}/${BASENAME}.key"
@@ -139,10 +148,8 @@ KEY_FILE="${KEY_DIR}/${BASENAME}.key"
 if [[ ! -f "$KEY_FILE" ]]; then
 
     echo
-    echo "[ERREUR] La clé correspondante n'existe pas :"
+    echo "[ERREUR] Clé correspondante introuvable :"
     echo "$KEY_FILE"
-    echo
-    echo "Impossible de restaurer cette sauvegarde."
 
     exit 1
 
@@ -153,7 +160,7 @@ echo "Clé trouvée :"
 echo "$KEY_FILE"
 
 # ------------------------------------------------------------
-# Recherche du hash correspondant
+# Recherche du hash AVANT chiffrement
 # ------------------------------------------------------------
 
 HASH_FILE="${HASH_DIR}/${BASENAME}.sha256"
@@ -161,18 +168,80 @@ HASH_FILE="${HASH_DIR}/${BASENAME}.sha256"
 if [[ ! -f "$HASH_FILE" ]]; then
 
     echo
-    echo "[ERREUR] Le hash correspondant n'existe pas :"
+    echo "[ERREUR] Hash original introuvable :"
     echo "$HASH_FILE"
-    echo
-    echo "Impossible de vérifier l'intégrité de cette sauvegarde."
 
     exit 1
 
 fi
 
 echo
-echo "Hash trouvé :"
+echo "Hash original trouvé :"
 echo "$HASH_FILE"
+
+# ------------------------------------------------------------
+# Recherche du hash de l'archive chiffrée
+# ------------------------------------------------------------
+
+ENC_HASH_FILE="${HASH_DIR}/${BASENAME}.enc.sha256"
+
+if [[ ! -f "$ENC_HASH_FILE" ]]; then
+
+    echo
+    echo "[ERREUR] Hash de l'archive chiffrée introuvable :"
+    echo "$ENC_HASH_FILE"
+    echo
+    echo "Cette sauvegarde ne peut pas être vérifiée."
+    echo "La restauration est annulée."
+
+    exit 1
+
+fi
+
+echo
+echo "Hash de l'archive chiffrée trouvé :"
+echo "$ENC_HASH_FILE"
+
+# ------------------------------------------------------------
+# Vérification du hash de l'archive CHIFFRÉE
+#
+# Cette étape ne déchiffre absolument rien.
+# ------------------------------------------------------------
+
+echo
+echo "============================================================"
+echo "Vérification de l'intégrité de l'archive chiffrée..."
+echo "============================================================"
+
+EXPECTED_ENC_HASH=$(awk '{print $1}' "$ENC_HASH_FILE")
+
+ACTUAL_ENC_HASH=$(sha256sum "$ARCHIVE_ENC" | awk '{print $1}')
+
+echo
+echo "Hash enregistré :"
+echo "$EXPECTED_ENC_HASH"
+
+echo
+echo "Hash actuel :"
+echo "$ACTUAL_ENC_HASH"
+
+echo
+
+if [[ "$EXPECTED_ENC_HASH" != "$ACTUAL_ENC_HASH" ]]; then
+
+    echo "============================================================"
+    echo "ERREUR : ARCHIVE CHIFFRÉE MODIFIÉE OU CORROMPUE"
+    echo "============================================================"
+    echo
+    echo "Le hash de l'archive chiffrée ne correspond pas."
+    echo
+    echo "La restauration est ANNULÉE."
+
+    exit 1
+
+fi
+
+echo "Hash de l'archive chiffrée : OK"
 
 # ------------------------------------------------------------
 # Fichier temporaire déchiffré
@@ -201,7 +270,6 @@ then
 
     echo
     echo "[ERREUR] Le déchiffrement a échoué."
-    echo "La clé est peut-être incorrecte."
 
     rm -f "$ARCHIVE_PLAIN"
 
@@ -212,37 +280,38 @@ fi
 echo "Déchiffrement réussi."
 
 # ------------------------------------------------------------
-# Vérification SHA-256
+# Vérification SHA-256 AVANT chiffrement
 # ------------------------------------------------------------
 
 echo
 echo "============================================================"
-echo "Vérification SHA-256..."
+echo "Vérification SHA-256 de l'archive originale..."
 echo "============================================================"
 
-if sha256sum -c "$HASH_FILE" 2>/dev/null; then
+EXPECTED_HASH=$(awk '{print $1}' "$HASH_FILE")
 
-    echo
-    echo "============================================================"
-    echo "HASH CORRECT"
-    echo "============================================================"
-    echo
-    echo "L'archive déchiffrée est identique à l'archive"
-    echo "qui avait été créée avant le chiffrement."
-    echo
+ACTUAL_HASH=$(sha256sum "$ARCHIVE_PLAIN" | awk '{print $1}')
 
-else
+echo
+echo "Hash enregistré AVANT chiffrement :"
+echo "$EXPECTED_HASH"
 
-    echo
+echo
+echo "Hash après déchiffrement :"
+echo "$ACTUAL_HASH"
+
+echo
+
+if [[ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]]; then
+
     echo "============================================================"
     echo "ERREUR : HASH DIFFÉRENT"
     echo "============================================================"
     echo
-    echo "L'archive déchiffrée ne correspond PAS au hash"
-    echo "enregistré avant le chiffrement."
+    echo "L'archive déchiffrée ne correspond pas"
+    echo "à l'archive créée avant le chiffrement."
     echo
     echo "La restauration est ANNULÉE."
-    echo
 
     rm -f "$ARCHIVE_PLAIN"
 
@@ -250,17 +319,21 @@ else
 
 fi
 
+echo "Hash de l'archive originale : OK"
+
 # ------------------------------------------------------------
 # Vérification supplémentaire de l'archive TAR
 # ------------------------------------------------------------
 
-echo "Vérification de l'archive TAR..."
+echo
+echo "Vérification de l'intégrité de l'archive TAR..."
 
 if ! tar -tzf "$ARCHIVE_PLAIN" >/dev/null; then
 
     echo
     echo "[ERREUR] L'archive TAR est invalide."
-    echo "La restauration est annulée."
+    echo
+    echo "La restauration est ANNULÉE."
 
     rm -f "$ARCHIVE_PLAIN"
 
@@ -275,26 +348,29 @@ echo "Archive TAR valide."
 # ------------------------------------------------------------
 
 echo
-echo "Destination de restauration :"
-echo "$RESTORE_DIR"
+echo "============================================================"
+echo "Destination :"
+echo "$RESTORE_DIR/html"
+echo "============================================================"
 
 # ------------------------------------------------------------
-# Confirmation avant remplacement
+# Confirmation
 # ------------------------------------------------------------
 
 echo
-echo "ATTENTION :"
 
 if [[ -d "${RESTORE_DIR}/html" ]]; then
 
-    echo "Le dossier suivant existe déjà :"
+    echo "ATTENTION :"
+    echo
+    echo "Le dossier actuel :"
     echo "${RESTORE_DIR}/html"
     echo
-    echo "Il sera déplacé en sauvegarde avant restauration."
+    echo "sera déplacé avant la restauration."
 
 else
 
-    echo "Le dossier html n'existe pas actuellement."
+    echo "Le dossier ${RESTORE_DIR}/html n'existe pas actuellement."
 
 fi
 
@@ -304,6 +380,7 @@ read -rp "Continuer la restauration ? [o/N] : " CONFIRM
 
 if [[ "${CONFIRM,,}" != "o" ]]; then
 
+    echo
     echo "Restauration annulée."
 
     rm -f "$ARCHIVE_PLAIN"
@@ -363,7 +440,7 @@ if id www-data >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------
-# Suppression du fichier temporaire
+# Suppression du fichier temporaire déchiffré
 # ------------------------------------------------------------
 
 rm -f "$ARCHIVE_PLAIN"
@@ -377,7 +454,11 @@ echo "============================================================"
 echo "       RESTAURATION TERMINÉE AVEC SUCCÈS"
 echo "============================================================"
 echo
-echo "Hash SHA-256 vérifié avec succès."
+echo "✓ Hash de l'archive chiffrée vérifié"
+echo "✓ Déchiffrement réussi"
+echo "✓ Hash de l'archive originale vérifié"
+echo "✓ Archive TAR vérifiée"
+echo "✓ Restauration effectuée"
 echo
 echo "Contenu restauré dans :"
 echo "${RESTORE_DIR}/html"
