@@ -2,7 +2,18 @@
 
 # ============================================================
 # restore_www.sh
-# Déchiffrement + restauration de /var/www/html
+#
+# Restauration d'une sauvegarde chiffrée de /var/www/html
+#
+# Fonctionnement :
+# 1. Sélection de l'archive
+# 2. Recherche automatique de la clé correspondante
+# 3. Recherche automatique du SHA-256 correspondant
+# 4. Déchiffrement
+# 5. Vérification du SHA-256
+# 6. Restauration uniquement si le hash correspond
+#
+# Les sauvegardes existantes ne sont pas supprimées.
 # ============================================================
 
 set -euo pipefail
@@ -15,6 +26,7 @@ BACKUP_ROOT="/backup"
 
 ARCHIVE_DIR="${BACKUP_ROOT}/archives"
 KEY_DIR="${BACKUP_ROOT}/keys"
+HASH_DIR="${BACKUP_ROOT}/hashes"
 
 RESTORE_DIR="/var/www"
 
@@ -23,7 +35,7 @@ RESTORE_DIR="/var/www"
 # ------------------------------------------------------------
 
 if [[ $EUID -ne 0 ]]; then
-    echo "[ERREUR] Ce script doit être exécuté avec sudo."
+    echo "[ERREUR] Le script doit être exécuté avec sudo."
     exit 1
 fi
 
@@ -37,22 +49,25 @@ if ! command -v tar >/dev/null 2>&1; then
     exit 1
 fi
 
+if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "[ERREUR] sha256sum n'est pas disponible."
+    exit 1
+fi
+
 if [[ ! -d "$ARCHIVE_DIR" ]]; then
     echo "[ERREUR] Le dossier $ARCHIVE_DIR n'existe pas."
     exit 1
 fi
 
 # ------------------------------------------------------------
-# Recherche des sauvegardes
+# Recherche des archives
 # ------------------------------------------------------------
 
 clear
 
 echo "============================================================"
-echo "          RESTAURATION D'UNE SAUVEGARDE"
+echo "       RESTAURATION D'UNE SAUVEGARDE CHIFFRÉE"
 echo "============================================================"
-echo
-echo "Archives disponibles :"
 echo
 
 mapfile -t ARCHIVES < <(
@@ -60,12 +75,12 @@ mapfile -t ARCHIVES < <(
 )
 
 if [[ ${#ARCHIVES[@]} -eq 0 ]]; then
-    echo "Aucune sauvegarde trouvée."
+    echo "Aucune archive chiffrée trouvée."
     exit 1
 fi
 
 # ------------------------------------------------------------
-# Affichage des sauvegardes
+# Affichage des archives
 # ------------------------------------------------------------
 
 for i in "${!ARCHIVES[@]}"; do
@@ -111,65 +126,59 @@ ARCHIVE_ENC="${ARCHIVES[$((SEL - 1))]}"
 
 BASENAME=$(basename "$ARCHIVE_ENC" .tar.gz.enc)
 
-KEY_FILE="${KEY_DIR}/${BASENAME}.key"
-
-ARCHIVE_PLAIN="/tmp/${BASENAME}.tar.gz"
-
-CLEANUP_KEY=0
-
 echo
 echo "Archive sélectionnée :"
 echo "$ARCHIVE_ENC"
 
 # ------------------------------------------------------------
-# Recherche de la clé
+# Recherche de la clé correspondante
 # ------------------------------------------------------------
 
-echo
+KEY_FILE="${KEY_DIR}/${BASENAME}.key"
 
-if [[ -f "$KEY_FILE" ]]; then
+if [[ ! -f "$KEY_FILE" ]]; then
 
-    echo "Clé trouvée automatiquement :"
+    echo
+    echo "[ERREUR] La clé correspondante n'existe pas :"
     echo "$KEY_FILE"
     echo
+    echo "Impossible de restaurer cette sauvegarde."
 
-    read -rp "Utiliser cette clé ? [O/n] : " USE_KEY
-
-    if [[ "${USE_KEY,,}" == "n" ]]; then
-        KEY_FILE=""
-    fi
+    exit 1
 
 fi
 
+echo
+echo "Clé trouvée :"
+echo "$KEY_FILE"
+
 # ------------------------------------------------------------
-# Demande manuelle de la clé
+# Recherche du hash correspondant
 # ------------------------------------------------------------
 
-if [[ -z "${KEY_FILE:-}" || ! -f "$KEY_FILE" ]]; then
+HASH_FILE="${HASH_DIR}/${BASENAME}.sha256"
+
+if [[ ! -f "$HASH_FILE" ]]; then
 
     echo
-    echo "La clé n'a pas été trouvée automatiquement."
+    echo "[ERREUR] Le hash correspondant n'existe pas :"
+    echo "$HASH_FILE"
     echo
-    echo "Entrez la clé de déchiffrement :"
+    echo "Impossible de vérifier l'intégrité de cette sauvegarde."
 
-    read -r MANUAL_KEY
-
-    if [[ -z "$MANUAL_KEY" ]]; then
-        echo "[ERREUR] Clé vide."
-        exit 1
-    fi
-
-    TMP_KEY=$(mktemp)
-
-    chmod 600 "$TMP_KEY"
-
-    echo "$MANUAL_KEY" > "$TMP_KEY"
-
-    KEY_FILE="$TMP_KEY"
-
-    CLEANUP_KEY=1
+    exit 1
 
 fi
+
+echo
+echo "Hash trouvé :"
+echo "$HASH_FILE"
+
+# ------------------------------------------------------------
+# Fichier temporaire déchiffré
+# ------------------------------------------------------------
+
+ARCHIVE_PLAIN="/tmp/${BASENAME}.tar.gz"
 
 # ------------------------------------------------------------
 # Déchiffrement
@@ -177,7 +186,7 @@ fi
 
 echo
 echo "============================================================"
-echo "Déchiffrement de l'archive..."
+echo "Déchiffrement..."
 echo "============================================================"
 
 if ! openssl enc \
@@ -192,121 +201,112 @@ then
 
     echo
     echo "[ERREUR] Le déchiffrement a échoué."
-    echo "La clé est probablement incorrecte."
+    echo "La clé est peut-être incorrecte."
 
     rm -f "$ARCHIVE_PLAIN"
-
-    if [[ "$CLEANUP_KEY" -eq 1 ]]; then
-        rm -f "$KEY_FILE"
-    fi
 
     exit 1
 
 fi
 
-echo
 echo "Déchiffrement réussi."
-echo "Archive temporaire : $ARCHIVE_PLAIN"
 
 # ------------------------------------------------------------
-# Vérification de l'archive
+# Vérification SHA-256
 # ------------------------------------------------------------
 
 echo
-echo "Vérification de l'archive..."
+echo "============================================================"
+echo "Vérification SHA-256..."
+echo "============================================================"
+
+if sha256sum -c "$HASH_FILE" 2>/dev/null; then
+
+    echo
+    echo "============================================================"
+    echo "HASH CORRECT"
+    echo "============================================================"
+    echo
+    echo "L'archive déchiffrée est identique à l'archive"
+    echo "qui avait été créée avant le chiffrement."
+    echo
+
+else
+
+    echo
+    echo "============================================================"
+    echo "ERREUR : HASH DIFFÉRENT"
+    echo "============================================================"
+    echo
+    echo "L'archive déchiffrée ne correspond PAS au hash"
+    echo "enregistré avant le chiffrement."
+    echo
+    echo "La restauration est ANNULÉE."
+    echo
+
+    rm -f "$ARCHIVE_PLAIN"
+
+    exit 1
+
+fi
+
+# ------------------------------------------------------------
+# Vérification supplémentaire de l'archive TAR
+# ------------------------------------------------------------
+
+echo "Vérification de l'archive TAR..."
 
 if ! tar -tzf "$ARCHIVE_PLAIN" >/dev/null; then
 
-    echo "[ERREUR] L'archive est invalide."
+    echo
+    echo "[ERREUR] L'archive TAR est invalide."
+    echo "La restauration est annulée."
 
     rm -f "$ARCHIVE_PLAIN"
-
-    if [[ "$CLEANUP_KEY" -eq 1 ]]; then
-        rm -f "$KEY_FILE"
-    fi
 
     exit 1
 
 fi
 
-echo "Archive valide."
+echo "Archive TAR valide."
 
 # ------------------------------------------------------------
-# Choix du dossier de restauration
+# Destination
 # ------------------------------------------------------------
 
 echo
-echo "============================================================"
-echo "Destination de restauration"
-echo "============================================================"
-echo
-echo "Par défaut : $RESTORE_DIR"
-echo
-
-read -rp "Restaurer dans [$RESTORE_DIR] ? (Entrée = oui) : " DEST
-
-DEST="${DEST:-$RESTORE_DIR}"
+echo "Destination de restauration :"
+echo "$RESTORE_DIR"
 
 # ------------------------------------------------------------
-# Vérification destination
+# Confirmation avant remplacement
 # ------------------------------------------------------------
 
-if [[ ! -d "$DEST" ]]; then
+echo
+echo "ATTENTION :"
 
+if [[ -d "${RESTORE_DIR}/html" ]]; then
+
+    echo "Le dossier suivant existe déjà :"
+    echo "${RESTORE_DIR}/html"
     echo
-    echo "Le dossier $DEST n'existe pas."
-
-    read -rp "Créer ce dossier ? [o/N] : " CREATE_DEST
-
-    if [[ "${CREATE_DEST,,}" == "o" ]]; then
-        mkdir -p "$DEST"
-    else
-        echo "Annulé."
-
-        rm -f "$ARCHIVE_PLAIN"
-
-        if [[ "$CLEANUP_KEY" -eq 1 ]]; then
-            rm -f "$KEY_FILE"
-        fi
-
-        exit 0
-    fi
-
-fi
-
-# ------------------------------------------------------------
-# Confirmation
-# ------------------------------------------------------------
-
-echo
-echo "============================================================"
-echo "ATTENTION"
-echo "============================================================"
-echo
-echo "La restauration va remplacer :"
-echo
-echo "$DEST/html"
-echo
-
-if [[ -d "${DEST}/html" ]]; then
-
-    echo "Le dossier html existe actuellement."
     echo "Il sera déplacé en sauvegarde avant restauration."
 
+else
+
+    echo "Le dossier html n'existe pas actuellement."
+
 fi
 
 echo
-read -rp "Continuer ? [o/N] : " CONFIRM
+
+read -rp "Continuer la restauration ? [o/N] : " CONFIRM
 
 if [[ "${CONFIRM,,}" != "o" ]]; then
 
     echo "Restauration annulée."
 
     rm -f "$ARCHIVE_PLAIN"
-
-    if [[ "$CLEANUP_KEY" -eq 1 ]]; then
-        rm -f "$KEY_FILE"
-    fi
 
     exit 0
 
@@ -316,19 +316,15 @@ fi
 # Sauvegarde de l'ancien dossier
 # ------------------------------------------------------------
 
-if [[ -d "${DEST}/html" ]]; then
+if [[ -d "${RESTORE_DIR}/html" ]]; then
 
-    SAFE="${DEST}/html.bak.$(date '+%Y%m%d_%H%M%S')"
-
-    echo
-    echo "Ancien dossier html :"
-    echo "$DEST/html"
+    SAFE="${RESTORE_DIR}/html.bak.$(date '+%Y%m%d_%H%M%S')"
 
     echo
-    echo "Déplacement vers :"
+    echo "Ancien dossier déplacé vers :"
     echo "$SAFE"
 
-    mv "${DEST}/html" "$SAFE"
+    mv "${RESTORE_DIR}/html" "$SAFE"
 
 fi
 
@@ -337,11 +333,9 @@ fi
 # ------------------------------------------------------------
 
 echo
-echo "============================================================"
 echo "Extraction de la sauvegarde..."
-echo "============================================================"
 
-tar -xzf "$ARCHIVE_PLAIN" -C "$DEST"
+tar -xzf "$ARCHIVE_PLAIN" -C "$RESTORE_DIR"
 
 echo "Extraction terminée."
 
@@ -354,13 +348,13 @@ if id www-data >/dev/null 2>&1; then
     echo
     echo "Application des permissions Apache..."
 
-    chown -R www-data:www-data "${DEST}/html"
+    chown -R www-data:www-data "${RESTORE_DIR}/html"
 
-    find "${DEST}/html" \
+    find "${RESTORE_DIR}/html" \
         -type d \
         -exec chmod 755 {} \;
 
-    find "${DEST}/html" \
+    find "${RESTORE_DIR}/html" \
         -type f \
         -exec chmod 644 {} \;
 
@@ -369,14 +363,10 @@ if id www-data >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------
-# Nettoyage
+# Suppression du fichier temporaire
 # ------------------------------------------------------------
 
 rm -f "$ARCHIVE_PLAIN"
-
-if [[ "$CLEANUP_KEY" -eq 1 ]]; then
-    rm -f "$KEY_FILE"
-fi
 
 # ------------------------------------------------------------
 # Fin
@@ -387,7 +377,11 @@ echo "============================================================"
 echo "       RESTAURATION TERMINÉE AVEC SUCCÈS"
 echo "============================================================"
 echo
+echo "Hash SHA-256 vérifié avec succès."
+echo
 echo "Contenu restauré dans :"
-echo "$DEST/html"
+echo "${RESTORE_DIR}/html"
 echo
 echo "============================================================"
+
+exit 0
