@@ -5,13 +5,14 @@
 #
 # Sauvegarde automatique et chiffrée de /var/www/html
 #
-# - Nouvelle clé AES-256 à chaque exécution
-# - Toutes les archives chiffrées sont conservées
-# - Toutes les clés sont conservées
-# - Toutes les sauvegardes sont identifiées par horodatage
-# - Aucune interaction avec l'utilisateur
-# - L'archive temporaire non chiffrée est supprimée
-#   après chiffrement réussi
+# Fonctionnement :
+# 1. Création d'une archive tar.gz
+# 2. Calcul du SHA-256 AVANT chiffrement
+# 3. Génération d'une nouvelle clé AES-256
+# 4. Chiffrement de l'archive
+# 5. Suppression de l'archive temporaire en clair
+#
+# Les archives, clés, hashes et logs sont conservés.
 # ============================================================
 
 set -euo pipefail
@@ -23,12 +24,14 @@ set -euo pipefail
 SOURCE_DIR="/var/www/html"
 
 BACKUP_ROOT="/backup"
+
 ARCHIVE_DIR="${BACKUP_ROOT}/archives"
 KEY_DIR="${BACKUP_ROOT}/keys"
+HASH_DIR="${BACKUP_ROOT}/hashes"
 LOG_DIR="${BACKUP_ROOT}/logs"
 
 # ------------------------------------------------------------
-# Vérification root
+# Vérifications
 # ------------------------------------------------------------
 
 if [[ $EUID -ne 0 ]]; then
@@ -36,18 +39,10 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# ------------------------------------------------------------
-# Vérification du dossier source
-# ------------------------------------------------------------
-
 if [[ ! -d "$SOURCE_DIR" ]]; then
     echo "[ERREUR] Le dossier $SOURCE_DIR n'existe pas." >&2
     exit 1
 fi
-
-# ------------------------------------------------------------
-# Vérification des commandes nécessaires
-# ------------------------------------------------------------
 
 if ! command -v openssl >/dev/null 2>&1; then
     echo "[ERREUR] openssl n'est pas installé." >&2
@@ -59,18 +54,24 @@ if ! command -v tar >/dev/null 2>&1; then
     exit 1
 fi
 
+if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "[ERREUR] sha256sum n'est pas disponible." >&2
+    exit 1
+fi
+
 # ------------------------------------------------------------
 # Création des dossiers
 # ------------------------------------------------------------
 
 mkdir -p "$ARCHIVE_DIR"
 mkdir -p "$KEY_DIR"
+mkdir -p "$HASH_DIR"
 mkdir -p "$LOG_DIR"
 
-# Protection des sauvegardes
 chmod 700 "$BACKUP_ROOT"
 chmod 700 "$ARCHIVE_DIR"
 chmod 700 "$KEY_DIR"
+chmod 700 "$HASH_DIR"
 chmod 700 "$LOG_DIR"
 
 # ------------------------------------------------------------
@@ -83,11 +84,15 @@ BASENAME="backup_www_html_${TIMESTAMP}"
 
 ARCHIVE_PLAIN="${ARCHIVE_DIR}/${BASENAME}.tar.gz"
 ARCHIVE_ENC="${ARCHIVE_DIR}/${BASENAME}.tar.gz.enc"
+
 KEY_FILE="${KEY_DIR}/${BASENAME}.key"
+
+HASH_FILE="${HASH_DIR}/${BASENAME}.sha256"
+
 LOG_FILE="${LOG_DIR}/${BASENAME}.log"
 
 # ------------------------------------------------------------
-# Fonction de journalisation
+# Fonction de log
 # ------------------------------------------------------------
 
 log() {
@@ -99,13 +104,13 @@ log() {
 # ------------------------------------------------------------
 
 log "============================================================"
-log "Début de la sauvegarde"
+log "DÉBUT DE LA SAUVEGARDE"
 log "Source : $SOURCE_DIR"
 log "ID     : $BASENAME"
 log "============================================================"
 
 # ------------------------------------------------------------
-# Génération d'une nouvelle clé AES-256
+# Génération de la clé AES-256
 # ------------------------------------------------------------
 
 log "Génération d'une nouvelle clé AES-256..."
@@ -117,23 +122,38 @@ chmod 600 "$KEY_FILE"
 log "Clé créée : $KEY_FILE"
 
 # ------------------------------------------------------------
-# Création de l'archive tar.gz
+# Création de l'archive temporaire
 # ------------------------------------------------------------
 
-log "Création de l'archive temporaire..."
+log "Création de l'archive tar.gz..."
 
 tar -czf "$ARCHIVE_PLAIN" \
     -C "$(dirname "$SOURCE_DIR")" \
     "$(basename "$SOURCE_DIR")"
 
-log "Archive temporaire créée : $ARCHIVE_PLAIN"
-log "Taille : $(du -h "$ARCHIVE_PLAIN" | cut -f1)"
+log "Archive créée : $ARCHIVE_PLAIN"
+
+# ------------------------------------------------------------
+# Calcul du SHA-256 AVANT chiffrement
+# ------------------------------------------------------------
+
+log "Calcul du SHA-256 de l'archive AVANT chiffrement..."
+
+sha256sum "$ARCHIVE_PLAIN" > "$HASH_FILE"
+
+chmod 600 "$HASH_FILE"
+
+HASH_VALUE=$(cut -d ' ' -f1 "$HASH_FILE")
+
+log "SHA-256 : $HASH_VALUE"
+
+log "Hash enregistré : $HASH_FILE"
 
 # ------------------------------------------------------------
 # Chiffrement AES-256-CBC
 # ------------------------------------------------------------
 
-log "Chiffrement de l'archive..."
+log "Chiffrement AES-256-CBC..."
 
 openssl enc \
     -aes-256-cbc \
@@ -147,38 +167,45 @@ openssl enc \
 chmod 600 "$ARCHIVE_ENC"
 
 log "Archive chiffrée créée : $ARCHIVE_ENC"
-log "Taille : $(du -h "$ARCHIVE_ENC" | cut -f1)"
 
 # ------------------------------------------------------------
-# Suppression UNIQUEMENT de l'archive temporaire en clair
+# Vérification que le fichier chiffré existe
+# ------------------------------------------------------------
+
+if [[ ! -f "$ARCHIVE_ENC" ]]; then
+    log "[ERREUR] L'archive chiffrée n'a pas été créée."
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# Suppression de l'archive temporaire en clair
+#
+# C'est la SEULE suppression effectuée par le script.
 # ------------------------------------------------------------
 
 rm -f "$ARCHIVE_PLAIN"
 
-log "Archive temporaire non chiffrée supprimée."
+log "Archive temporaire en clair supprimée."
 
 # ------------------------------------------------------------
 # Vérification finale
 # ------------------------------------------------------------
 
-if [[ ! -f "$ARCHIVE_ENC" ]]; then
-    log "[ERREUR] L'archive chiffrée n'existe pas."
+if [[ -f "$ARCHIVE_ENC" && -f "$KEY_FILE" && -f "$HASH_FILE" ]]; then
+
+    log "============================================================"
+    log "SAUVEGARDE TERMINÉE AVEC SUCCÈS"
+    log "Archive : $ARCHIVE_ENC"
+    log "Clé     : $KEY_FILE"
+    log "Hash    : $HASH_FILE"
+    log "============================================================"
+
+else
+
+    log "[ERREUR] Un ou plusieurs fichiers de sauvegarde sont manquants."
+
     exit 1
+
 fi
-
-if [[ ! -f "$KEY_FILE" ]]; then
-    log "[ERREUR] La clé n'existe pas."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Fin
-# ------------------------------------------------------------
-
-log "============================================================"
-log "Sauvegarde terminée avec succès"
-log "Archive : $ARCHIVE_ENC"
-log "Clé     : $KEY_FILE"
-log "============================================================"
 
 exit 0
